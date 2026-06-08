@@ -38,10 +38,6 @@ The project aims to assist farmers, researchers, and agricultural stakeholders i
 * Matplotlib
 * Seaborn
 
-### Web Development
-
-* Streamlit / Flask (update based on your implementation)
-
 ### Development Tools
 
 * Jupyter Notebook
