@@ -1,0 +1,1026 @@
+let latestStatus = null;
+
+const statusDot = document.querySelector(".status-dot");
+const statusText = document.getElementById("status-text");
+const debugLog = document.getElementById("debug-log");
+const auditWarnings = document.getElementById("audit-warnings");
+const recommendationSummary = document.getElementById("recommendation-summary");
+const recommendationMode = document.getElementById("recommendation-mode");
+
+const formatJSON = (obj) => JSON.stringify(obj, null, 2);
+
+let soilAnalysisLoaded = false;
+let imageAnalysisLoaded = false;
+let compareState = {
+  originalSrc: "",
+  enhancedSrc: "",
+  originalLabel: "Original",
+  enhancedLabel: "Enhanced",
+  reversed: false,
+};
+
+// --- i18n (English default + Marathi toggle) ---
+const I18N = (() => {
+  const DEFAULT_LANG = "en";
+  const STORAGE_KEY = "soilintel.lang";
+  let lang = localStorage.getItem(STORAGE_KEY) || DEFAULT_LANG;
+  let mr = null;
+
+  async function ensureMrLoaded() {
+    if (mr) return;
+    const res = await fetch("/web/i18n/mr.json", { cache: "no-cache" });
+    if (!res.ok) throw new Error("Failed to load Marathi translations");
+    mr = await res.json();
+  }
+
+  function t(key, fallback) {
+    if (lang !== "mr") return fallback;
+    if (mr && typeof mr[key] === "string") return mr[key];
+    return fallback;
+  }
+
+  async function setLang(nextLang) {
+    lang = nextLang === "mr" ? "mr" : "en";
+    localStorage.setItem(STORAGE_KEY, lang);
+    if (lang === "mr") {
+      try { await ensureMrLoaded(); } catch (_) { /* fallback to English */ }
+    }
+    applyTranslations();
+    updateLangToggleUI();
+  }
+
+  function getLang() {
+    return lang;
+  }
+
+  function updateLangToggleUI() {
+    const root = document.getElementById("lang-toggle");
+    if (!root) return;
+    root.querySelectorAll(".lang-btn").forEach((btn) => {
+      btn.classList.toggle("active", btn.dataset.lang === lang);
+    });
+  }
+
+  function applyTranslations() {
+    // text nodes
+    document.querySelectorAll("[data-i18n]").forEach((el) => {
+      const key = el.getAttribute("data-i18n");
+      const fallback = el.getAttribute("data-i18n-fallback") || el.textContent || "";
+      el.textContent = t(key, fallback);
+    });
+
+    // placeholders
+    document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+      const key = el.getAttribute("data-i18n-placeholder");
+      const fallback = el.getAttribute("data-i18n-placeholder-fallback") || el.getAttribute("placeholder") || "";
+      el.setAttribute("placeholder", t(key, fallback));
+    });
+  }
+
+  async function init() {
+    if (lang === "mr") {
+      try { await ensureMrLoaded(); } catch (_) { lang = "en"; }
+    }
+    applyTranslations();
+    updateLangToggleUI();
+    const toggle = document.getElementById("lang-toggle");
+    if (toggle) {
+      toggle.addEventListener("click", (e) => {
+        const btn = e.target.closest(".lang-btn");
+        if (!btn) return;
+        setLang(btn.dataset.lang);
+      });
+    }
+  }
+
+  return { init, t, setLang, getLang, applyTranslations };
+})();
+
+const CROP_ICONS = {
+  "rice": "fa-solid fa-wheat-awn",
+  "maize": "fa-solid fa-seedling",
+  "chickpea": "fa-solid fa-bowl-food",
+  "kidneybeans": "fa-solid fa-seedling",
+  "pigeonpeas": "fa-solid fa-seedling",
+  "mothbeans": "fa-solid fa-seedling",
+  "mungbean": "fa-solid fa-seedling",
+  "blackgram": "fa-solid fa-seedling",
+  "lentil": "fa-solid fa-seedling",
+  "pomegranate": "fa-solid fa-apple-whole",
+  "banana": "fa-solid fa-leaf",
+  "mango": "fa-solid fa-apple-whole",
+  "grapes": "fa-solid fa-grapes",
+  "watermelon": "fa-solid fa-apple-whole",
+  "muskmelon": "fa-solid fa-apple-whole",
+  "apple": "fa-solid fa-apple-whole",
+  "orange": "fa-solid fa-apple-whole",
+  "papaya": "fa-solid fa-leaf",
+  "coconut": "fa-solid fa-leaf",
+  "cotton": "fa-solid fa-clover",
+  "jute": "fa-solid fa-leaf",
+  "coffee": "fa-solid fa-mug-hot"
+};
+
+const SOIL_ICONS = {
+  "alluvial": "fa-solid fa-water",
+  "black": "fa-solid fa-mountain",
+  "clay": "fa-solid fa-faucet-drip",
+  "red": "fa-solid fa-fire",
+  "laterite": "fa-solid fa-brick",
+  "marshy": "fa-solid fa-water",
+  "sandy": "fa-solid fa-umbrella-beach"
+};
+
+async function fetchStatus() {
+  try {
+    const response = await fetch("/api/status");
+    if (!response.ok) {
+      throw new Error("Backend Offline");
+    }
+    const data = await response.json();
+    latestStatus = data;
+    updateStatusUI(data);
+  } catch (error) {
+    statusDot.className = "status-dot offline";
+    statusText.textContent = "System Offline";
+    console.error(error);
+  }
+}
+
+function updateStatusUI(data) {
+  const isReady = Boolean(data.soil_audit?.runnable);
+  statusDot.className = `status-dot ${isReady ? "online" : "offline"}`;
+  statusText.textContent = isReady ? "System Ready" : "System Issues Detected";
+  debugLog.textContent = formatJSON(data);
+
+  auditWarnings.innerHTML = "";
+  const warnings = [
+    ...(data.soil_audit?.warnings || []),
+    ...(data.recommendation_audit?.warnings || []),
+  ];
+  warnings.forEach((warning) => {
+    const p = document.createElement("p");
+    p.textContent = `• ${warning}`;
+    p.style.color = "#e63946";
+    p.style.fontSize = "0.85rem";
+    p.style.margin = "0.2rem 0";
+    auditWarnings.appendChild(p);
+  });
+
+  const recommendationAudit = data.recommendation_audit || {};
+  if (recommendationAudit.active_mode === "crop_recommendation") {
+    recommendationSummary.textContent =
+      `Input soil and climate parameters to receive crop recommendations across ${recommendationAudit.crop_type_count || "multiple"} crop types.`;
+    recommendationMode.textContent =
+      `Active model: ${recommendationAudit.best_crop_model || "Crop recommendation model"}`;
+  } else {
+    recommendationSummary.textContent =
+      "Input soil and climate parameters to inspect the legacy fallback model while the crop recommendation model is still pending integration.";
+    recommendationMode.textContent = "Active model: Legacy Soil ANN fallback";
+  }
+}
+
+function initTabs() {
+  const tabs = document.querySelectorAll(".tab-btn");
+  const panels = document.querySelectorAll(".tab-panel");
+
+  tabs.forEach((tab) => {
+    tab.addEventListener("click", () => {
+      const target = tab.dataset.tab;
+      tabs.forEach((item) => item.classList.remove("active"));
+      panels.forEach((panel) => panel.classList.remove("active"));
+      tab.classList.add("active");
+      document.getElementById(target).classList.add("active");
+
+      if (target === "analysis" && !soilAnalysisLoaded) {
+        loadSoilAnalysis();
+      }
+      if (target === "model-insights" && !imageAnalysisLoaded) {
+        loadImageAnalysis();
+      }
+    });
+  });
+}
+
+async function loadSoilAnalysis() {
+  const status = document.getElementById("analysis-status");
+  const grid = document.getElementById("analysis-plot-grid");
+  if (!status || !grid) return;
+
+  status.textContent = I18N.t("analysis.loading", "Loading graphs…");
+  grid.innerHTML = "";
+
+  try {
+    const response = await fetch("/api/soil/analysis/list");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Failed to load plot list");
+
+    const plots = data.plots || [];
+    if (!plots.length) {
+      status.textContent = I18N.t("analysis.none", "No plots available.");
+      soilAnalysisLoaded = true;
+      return;
+    }
+
+    status.textContent = `Loaded ${plots.length} graphs.`;
+    plots.forEach((plot) => {
+      const wrapper = document.createElement("div");
+      wrapper.className = "analysis-plot";
+
+      const title = document.createElement("h4");
+      title.textContent = plot.title || plot.name;
+
+      const img = document.createElement("img");
+      img.alt = plot.title || plot.name;
+      img.loading = "lazy";
+      img.src = `/api/soil/analysis/plot?name=${encodeURIComponent(plot.name)}&dpi=140`;
+
+      wrapper.appendChild(title);
+      wrapper.appendChild(img);
+      grid.appendChild(wrapper);
+
+      // Add zoom functionality
+      img.addEventListener("click", () => {
+        const zoomSrc = `/api/soil/analysis/plot?name=${encodeURIComponent(plot.name)}&dpi=320`;
+        openZoom(zoomSrc, plot.title || plot.name);
+      });
+    });
+
+    soilAnalysisLoaded = true;
+  } catch (err) {
+    status.textContent = I18N.t("analysis.error", `Error loading graphs: ${err.message || err}`);
+  }
+}
+
+async function handleTabularSubmit(event) {
+  event.preventDefault();
+  const resultCard = document.getElementById("ann-result-card");
+  const display = document.getElementById("ann-display");
+  const emptyState = resultCard.querySelector(".result-empty");
+
+  const payload = {
+    soil_type: document.getElementById("soil_type").value,
+    irrigation_available: document.getElementById("irrigation_available").value,
+    farm_size_acres: document.getElementById("farm_size_acres").value,
+    soil_ph: document.getElementById("soil_ph").value,
+    soil_nitrogen: document.getElementById("soil_nitrogen").value,
+    soil_phosphorus: document.getElementById("soil_phosphorus").value,
+    soil_potassium: document.getElementById("soil_potassium").value,
+    soil_organic_matter: document.getElementById("soil_organic_matter").value,
+    temperature: document.getElementById("temperature").value,
+    rainfall: document.getElementById("rainfall").value,
+    humidity: document.getElementById("humidity").value,
+    profile: window.CURRENT_SOIL_PROFILE || null // Pass the profile to the agent
+  };
+
+  emptyState.classList.add("hidden");
+  display.classList.remove("hidden");
+    document.getElementById("ann-crop-type").textContent = "Analyzing...";
+    document.getElementById("ann-soil-type").textContent = "Analyzing...";
+    document.getElementById("ann-details").classList.add("hidden");
+    document.getElementById("action-plan-section").style.display = "none";
+    document.getElementById("chat-section").style.display = "none";
+    document.getElementById("chat-history").innerHTML = "";
+    resultCard.querySelector(".confidence-section").classList.remove("hidden"); // Reset if needed
+
+  try {
+    const response = await fetch("/api/soil/predict-tabular", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const result = await response.json();
+    if (!response.ok) {
+      throw new Error(result.error);
+    }
+    renderANNResult(result);
+  } catch (err) {
+    document.getElementById("ann-soil-type").textContent = "Error";
+    document.getElementById("ann-details").textContent = err.message;
+  }
+}
+
+function renderANNResult(result) {
+  if (result.mode === "hybrid_recommendation") {
+    const crop = result.crop_label.toLowerCase().replace(/_/g, "").replace(/\s/g, "");
+    const soil = result.soil_label ? result.soil_label.toLowerCase().replace(/_/g, "").replace(/\s/g, "") : "";
+    
+    // Update Crop Label and Icon
+    document.getElementById("ann-crop-type").textContent = result.crop_label.replace(/_/g, " ");
+    const cropIconWrapper = document.getElementById("crop-icon-wrapper");
+    if (cropIconWrapper && CROP_ICONS[crop]) {
+      cropIconWrapper.innerHTML = `<i class="${CROP_ICONS[crop]}"></i>`;
+    }
+
+    // Update the result card
+    if (result.soil_label) {
+      const label = result.soil_label.replace(/_/g, " ");
+      const soilDisplay = document.getElementById("ann-soil-type");
+      if (soilDisplay) {
+        soilDisplay.textContent = label;
+      }
+      
+      // Update Soil Icon if possible
+      const soilContainer = soilDisplay ? soilDisplay.closest(".main-prediction") : null;
+      const soilIconEl = soilContainer ? soilContainer.querySelector(".prediction-icon") : null;
+      if (soilIconEl && SOIL_ICONS[soil]) {
+        soilIconEl.innerHTML = `<i class="${SOIL_ICONS[soil]}"></i>`;
+      }
+      
+      // Smart Lock: Update and disable the manual soil type selector
+      const manualSelector = document.getElementById("soil_type");
+      if (manualSelector) {
+        // Try to find matching option
+        for (let i = 0; i < manualSelector.options.length; i++) {
+          if (manualSelector.options[i].text.toLowerCase().includes(label.toLowerCase())) {
+            manualSelector.selectedIndex = i;
+            break;
+          }
+        }
+        manualSelector.disabled = true;
+        
+        // Add a small hint that it's locked
+        const parent = manualSelector.closest(".form-group");
+        if (parent && !document.getElementById("lock-hint")) {
+          const hint = document.createElement("span");
+          hint.id = "lock-hint";
+          hint.style.fontSize = "0.7rem";
+          hint.style.color = "var(--primary)";
+          hint.style.marginTop = "4px";
+          hint.style.display = "block";
+          hint.innerText = "✓ Locked to scanned result";
+          parent.appendChild(hint);
+        }
+      }
+    }
+    // Hide confidence for tabular as requested
+    const confSection = document.querySelector("#ann-result-card .confidence-section");
+    if (confSection) confSection.classList.add("hidden");
+    
+    // Show Action Plan & Chat
+    if (result.action_plan) {
+      document.getElementById("action-plan-section").style.display = "block";
+      document.getElementById("chat-section").style.display = "block";
+      
+      let cleanPlan = result.action_plan.trim();
+      if (cleanPlan.startsWith("```")) {
+        cleanPlan = cleanPlan.replace(/^```(markdown|md)?\s*/i, "").replace(/\s*```$/i, "");
+      }
+      document.getElementById("action-plan-content").innerHTML = marked.parse(cleanPlan);
+      
+      // Initialize Chat Form listener if not already initialized
+      const chatForm = document.getElementById("chat-form");
+      chatForm.onsubmit = async (e) => {
+        e.preventDefault();
+        const input = document.getElementById("chat-input");
+        const msg = input.value.trim();
+        if(!msg) return;
+        
+        const history = document.getElementById("chat-history");
+        history.innerHTML += `<div class="chat-bubble user-bubble"><strong>${I18N.t("chat.you", "You:")}</strong> ${msg}</div>`;
+        input.value = "";
+        
+        const typingId = "typing-" + Date.now();
+        history.innerHTML += `<div id="${typingId}" class="typing-indicator"><em>${I18N.t("chat.processing", "AI is processing...")}</em></div>`;
+        history.scrollTop = history.scrollHeight;
+        
+        try {
+          const res = await fetch("/api/agent/chat", {
+            method: "POST",
+            headers: {"Content-Type": "application/json"},
+            body: JSON.stringify({message: msg})
+          });
+          const data = await res.json();
+          document.getElementById(typingId).remove();
+          
+          if(res.ok) {
+            const reply = data.reply;
+            
+            // 1. Render Groq Response (General AI)
+            let groqText = typeof reply === 'object' ? reply.groq : reply;
+            if (groqText.startsWith("```")) {
+              groqText = groqText.replace(/^```(markdown|md)?\s*/i, "").replace(/\s*```$/i, "");
+            }
+            history.innerHTML += `
+              <div class="chat-bubble groq-bubble">
+                <div class="bubble-header">
+                  <span><i class="fa-solid fa-robot"></i> Groq AI Assistant</span>
+                  <button type="button" class="tts-btn" title="Listen"><i class="fa-solid fa-volume-high"></i></button>
+                </div>
+                <div class="bubble-content">${marked.parse(groqText)}</div>
+              </div>`;
+
+            // 2. Render Local Response (SoilIntel Built LLM)
+            if (typeof reply === 'object' && reply.local) {
+              history.innerHTML += `
+                <div class="chat-bubble local-bubble">
+                  <div class="bubble-header">
+                    <span><i class="fa-solid fa-microchip"></i> SoilIntel Predictive Analysis</span>
+                    <button type="button" class="tts-btn" title="Listen"><i class="fa-solid fa-volume-high"></i></button>
+                  </div>
+                  <div class="bubble-content">${marked.parse(reply.local)}</div>
+                </div>`;
+            }
+          } else {
+            history.innerHTML += `<div class="chat-bubble error-bubble"><strong>Error:</strong> ${data.error}</div>`;
+          }
+        } catch(err) {
+          document.getElementById(typingId).remove();
+          history.innerHTML += `<div class="chat-bubble error-bubble"><strong>Error:</strong> Network issue</div>`;
+        }
+        history.scrollTop = history.scrollHeight;
+      };
+    }
+  } else {
+    const label = result.label.replace(/_/g, " ");
+    const probability = Math.round(result.top_probability * 100);
+    document.getElementById("ann-soil-type").textContent = label;
+    document.getElementById("ann-confidence-bar").style.width = `${probability}%`;
+    document.getElementById("ann-confidence-percent").textContent = `${probability}%`;
+  }
+
+  const details = document.getElementById("ann-details");
+  const note = result.warning ? `<div class="warning-note"><strong>Note:</strong> ${result.warning}</div>` : "";
+  const title = result.mode === "crop_recommendation" ? "Confidence Rankings" : (result.model_name || "Probabilities");
+  
+  details.innerHTML = note + 
+    `<div class="rankings-title">${title}</div>` +
+    `<div class="rankings-grid">` +
+    result.ranked_predictions
+      .map((item) => `
+        <div class="ranking-item">
+          <span class="ranking-label">${item.label.replace(/_/g, " ")}</span>
+          <span class="ranking-value">${Math.round(item.probability * 100)}%</span>
+        </div>
+      `)
+      .join("") + 
+    `</div>`;
+}
+
+function initImageUpload() {
+  const dropZone = document.getElementById("drop-zone");
+  const fileInput = document.getElementById("soil-image");
+  const preview = document.getElementById("image-preview");
+  const previewContainer = document.getElementById("image-preview-container");
+
+  // Click to upload
+  dropZone.addEventListener("click", () => fileInput.click());
+
+  // Drag and drop support
+  dropZone.addEventListener("dragover", (e) => {
+    e.preventDefault();
+    dropZone.classList.add("drag-over");
+  });
+
+  dropZone.addEventListener("dragleave", () => {
+    dropZone.classList.remove("drag-over");
+  });
+
+  dropZone.addEventListener("drop", (e) => {
+    e.preventDefault();
+    dropZone.classList.remove("drag-over");
+    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
+      fileInput.files = e.dataTransfer.files;
+      handleFileSelect();
+    }
+  });
+
+  fileInput.addEventListener("change", handleFileSelect);
+
+  function handleFileSelect() {
+    const file = fileInput.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      preview.src = e.target.result;
+      previewContainer.classList.remove("hidden");
+      dropZone.classList.add("hidden");
+    };
+    reader.readAsDataURL(file);
+  }
+
+  // Remove image functionality
+  document.getElementById("remove-image")?.addEventListener("click", () => {
+    fileInput.value = "";
+    preview.src = "";
+    previewContainer.classList.add("hidden");
+    dropZone.classList.remove("hidden");
+  });
+}
+
+async function handleImageSubmit(event) {
+  event.preventDefault();
+  const fileInput = document.getElementById("soil-image");
+  const resultCard = document.getElementById("cnn-result-card");
+  const file = fileInput.files[0];
+  if (!file) {
+    alert("Please select or drag an image first.");
+    return;
+  }
+
+  resultCard.classList.remove("hidden");
+  document.getElementById("cnn-soil-type").textContent = "Scanning...";
+  document.getElementById("cnn-ranked-list").classList.add("hidden");
+  document.getElementById("cnn-confidence-bar").style.width = "0%";
+  document.getElementById("cnn-confidence-percent").textContent = "0%";
+
+  const reader = new FileReader();
+  reader.readAsDataURL(file);
+  reader.onload = async () => {
+    const base64 = reader.result.split(",")[1];
+    try {
+      const response = await fetch("/api/soil/predict", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ image_base64: base64 }),
+      });
+      const result = await response.json();
+      if (!response.ok) {
+        throw new Error(result.error);
+      }
+      renderCNNResult(result);
+    } catch (err) {
+      document.getElementById("cnn-soil-type").textContent = "Error";
+      document.getElementById("cnn-ranked-list").textContent = err.message;
+    }
+  };
+}
+
+function renderCNNResult(result) {
+  const label = result.label.replace(/_/g, " ");
+  const probability = Math.round(result.top_probability * 100);
+
+  document.getElementById("cnn-soil-type").textContent = label;
+  document.getElementById("cnn-confidence-bar").style.width = `${probability}%`;
+  document.getElementById("cnn-confidence-percent").textContent = `${probability}%`;
+
+  // --- New: Update Soil Profile and Pre-fill Tab 2 ---
+  if (result.profile) {
+    window.CURRENT_SOIL_PROFILE = result.profile; // Store for the agent
+    const p = result.profile;
+    document.getElementById("soil-profile-card")?.classList.remove("hidden");
+    document.getElementById("profile-desc").textContent = p.description;
+    document.getElementById("profile-crops").textContent = p.best_crops;
+    document.getElementById("profile-weather").textContent = p.weather;
+
+    // Pre-fill Tab 2 Soil Analysis Fields
+    if (p.baselines) {
+      Object.keys(p.baselines).forEach(key => {
+        const input = document.getElementById(key);
+        if (input) {
+          input.value = p.baselines[key];
+          // Trigger a small highlight effect to show it was auto-filled
+          input.style.backgroundColor = "rgba(59, 130, 246, 0.1)";
+          setTimeout(() => { input.style.backgroundColor = ""; }, 2000);
+        }
+      });
+      
+      // Also pre-select the soil type in the Tab 2 dropdown if it exists
+      const typeSelect = document.getElementById("soil_type");
+      if (typeSelect) {
+          // Normalize label for select (Alluvial_Soil -> Alluvial_Soil or Alluvial Soil)
+          typeSelect.value = result.label;
+      }
+    }
+  }
+
+  // Smart Lock: Update and disable the manual soil type selector
+  const manualSelector = document.getElementById("soil_type");
+  if (manualSelector) {
+    let found = false;
+    const baseName = label.toLowerCase().replace(" soil", "");
+    for (let i = 0; i < manualSelector.options.length; i++) {
+      if (manualSelector.options[i].text.toLowerCase().includes(baseName)) {
+        manualSelector.selectedIndex = i;
+        found = true;
+        break;
+      }
+    }
+    if (!found) {
+      const newOption = document.createElement("option");
+      newOption.value = result.label;
+      newOption.text = label;
+      manualSelector.appendChild(newOption);
+      manualSelector.selectedIndex = manualSelector.options.length - 1;
+    }
+    manualSelector.disabled = true;
+    const parent = manualSelector.closest(".form-group");
+    if (parent && !document.getElementById("lock-hint")) {
+      const hint = document.createElement("span");
+      hint.id = "lock-hint";
+      hint.style.fontSize = "0.7rem";
+      hint.style.color = "var(--primary)";
+      hint.style.marginTop = "4px";
+      hint.style.display = "block";
+      hint.innerText = "✓ Locked to scanned result";
+      parent.appendChild(hint);
+    }
+  }
+
+  const list = document.getElementById("cnn-ranked-list");
+  list.innerHTML =
+    `<div class="rankings-title">Confidence Rankings</div>` +
+    `<div class="rankings-grid">` +
+    result.ranked_predictions
+      .map((item) => `
+        <div class="ranking-item">
+          <span class="ranking-label">${item.label.replace(/_/g, " ")}</span>
+          <span class="ranking-value">${Math.round(item.probability * 100)}%</span>
+        </div>
+      `)
+      .join("") +
+    `</div>`;
+}
+
+function initModals() {
+  const toggle = document.getElementById("debug-toggle");
+  const modal = document.getElementById("debug-modal");
+  const close = modal.querySelector(".close-btn");
+
+  toggle.addEventListener("click", () => modal.classList.remove("hidden"));
+  close.addEventListener("click", () => modal.classList.add("hidden"));
+  window.addEventListener("click", (event) => {
+    if (event.target === modal) {
+      modal.classList.add("hidden");
+    }
+  });
+
+  const compareModal = document.getElementById("compare-modal");
+  const compareClose = compareModal?.querySelector(".compare-close");
+  const comparePrev = document.getElementById("compare-prev");
+  const compareNext = document.getElementById("compare-next");
+  const compareSwap = document.getElementById("swap-compare-btn");
+
+  if (compareClose) {
+    compareClose.addEventListener("click", () => compareModal.classList.add("hidden"));
+  }
+  if (comparePrev) {
+    comparePrev.addEventListener("click", () => toggleCompareSides());
+  }
+  if (compareNext) {
+    compareNext.addEventListener("click", () => toggleCompareSides());
+  }
+  if (compareSwap) {
+    compareSwap.addEventListener("click", () => toggleCompareSides());
+  }
+  window.addEventListener("keydown", (event) => {
+    if (!compareModal || compareModal.classList.contains("hidden")) return;
+    if (event.key === "Escape") {
+      compareModal.classList.add("hidden");
+    } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+      event.preventDefault();
+      toggleCompareSides();
+    }
+  });
+}
+
+function initImageZoom() {
+  const modal = document.getElementById("image-modal");
+  if (!modal) return;
+
+  const closeBtn = modal.querySelector(".zoom-close");
+  if (!closeBtn) return;
+  
+  closeBtn.addEventListener("click", () => modal.classList.add("hidden"));
+  modal.addEventListener("click", (e) => {
+    if (e.target === modal) modal.classList.add("hidden");
+  });
+}
+
+function openZoom(src, caption) {
+  const modal = document.getElementById("image-modal");
+  const img = document.getElementById("zoomed-image");
+  const cap = document.getElementById("zoom-caption");
+  if (!modal || !img || !cap) return;
+  
+  img.src = src;
+  cap.textContent = caption || "Image View";
+  modal.classList.remove("hidden");
+}
+
+function updateCompareModal() {
+  const compareModal = document.getElementById("compare-modal");
+  const leftImg = document.getElementById("compare-left-image");
+  const rightImg = document.getElementById("compare-right-image");
+  const leftLabel = document.getElementById("compare-left-label");
+  const rightLabel = document.getElementById("compare-right-label");
+  const caption = document.getElementById("compare-caption");
+  if (!compareModal || !leftImg || !rightImg || !leftLabel || !rightLabel || !caption) return;
+
+  const leftIsOriginal = !compareState.reversed;
+  leftImg.src = leftIsOriginal ? compareState.originalSrc : compareState.enhancedSrc;
+  rightImg.src = leftIsOriginal ? compareState.enhancedSrc : compareState.originalSrc;
+  leftLabel.textContent = leftIsOriginal ? compareState.originalLabel : compareState.enhancedLabel;
+  rightLabel.textContent = leftIsOriginal ? compareState.enhancedLabel : compareState.originalLabel;
+  caption.textContent = leftIsOriginal
+    ? `${compareState.originalLabel} | ${compareState.enhancedLabel}`
+    : `${compareState.enhancedLabel} | ${compareState.originalLabel}`;
+}
+
+function openCompareModal(originalSrc, enhancedSrc, meta = {}) {
+  const compareModal = document.getElementById("compare-modal");
+  if (!compareModal || !originalSrc || !enhancedSrc) return;
+
+  compareState.originalSrc = originalSrc;
+  compareState.enhancedSrc = enhancedSrc;
+  compareState.originalLabel = meta.originalLabel || "Original";
+  compareState.enhancedLabel = meta.enhancedLabel || "Enhanced";
+  compareState.reversed = false;
+  updateCompareModal();
+  compareModal.classList.remove("hidden");
+}
+
+function toggleCompareSides() {
+  const compareModal = document.getElementById("compare-modal");
+  if (!compareModal || compareModal.classList.contains("hidden")) return;
+  compareState.reversed = !compareState.reversed;
+  updateCompareModal();
+}
+
+// --- Chatbot TTS (Text-to-Speech) ---
+function isTtsSupported() {
+  return typeof window !== "undefined" &&
+    "speechSynthesis" in window &&
+    typeof window.SpeechSynthesisUtterance === "function";
+}
+
+function splitForSpeech(text) {
+  const cleaned = (text || "").replace(/\s+/g, " ").trim();
+  if (!cleaned) return [];
+  // Prefer shorter chunks for stability.
+  return cleaned
+    .split(/(?<=[.?!।])\s+/)
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(0, 30);
+}
+
+function pickVoice(preferMarathi) {
+  const voices = window.speechSynthesis.getVoices ? window.speechSynthesis.getVoices() : [];
+  if (!voices.length) return null;
+
+  if (preferMarathi) {
+    const mr = voices.find((v) => (v.lang || "").toLowerCase().startsWith("mr"));
+    if (mr) return mr;
+  }
+
+  const indian = voices.find((v) => (v.lang || "").toLowerCase().endsWith("-in"));
+  return indian || voices[0] || null;
+}
+
+async function speak(text) {
+  const note = document.getElementById("tts-note");
+  if (!isTtsSupported()) {
+    if (note) note.textContent = I18N.t("chat.audio_unsupported", "Audio not supported in this browser.");
+    return;
+  }
+
+  if (note) note.textContent = "";
+
+  const parts = splitForSpeech(text);
+  if (!parts.length) return;
+
+  window.speechSynthesis.cancel();
+
+  // Voices can be lazy-loaded by the browser.
+  const preferMarathi = I18N.getLang && I18N.getLang() === "mr";
+  const ensureVoices = () => new Promise((resolve) => {
+    const existing = window.speechSynthesis.getVoices();
+    if (existing && existing.length) return resolve(existing);
+    window.speechSynthesis.onvoiceschanged = () => resolve(window.speechSynthesis.getVoices());
+    setTimeout(() => resolve(window.speechSynthesis.getVoices()), 500);
+  });
+
+  await ensureVoices();
+  const voice = pickVoice(preferMarathi);
+
+  for (const part of parts) {
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((resolve) => {
+      const utter = new SpeechSynthesisUtterance(part);
+      if (voice) utter.voice = voice;
+      utter.rate = 1;
+      utter.pitch = 1;
+      utter.onend = () => resolve();
+      utter.onerror = () => resolve();
+      window.speechSynthesis.speak(utter);
+    });
+  }
+}
+
+function renderEnhancementComparison(originalSrc, enhancedSrc, meta = {}) {
+  const ganCard = document.getElementById("gan-trace-card");
+  const ganGrid = document.getElementById("gan-augmentation-grid");
+  if (!ganCard || !ganGrid) return;
+
+  if (!originalSrc || !enhancedSrc) return;
+
+  const originalLabel = meta.originalLabel || "Original";
+  const enhancedLabel = meta.enhancedLabel || "Real-ESRGAN Enhanced";
+  compareState.originalSrc = originalSrc;
+  compareState.enhancedSrc = enhancedSrc;
+  compareState.originalLabel = originalLabel;
+  compareState.enhancedLabel = enhancedLabel;
+  ganCard.classList.remove("hidden");
+  ganGrid.innerHTML = `
+    <div class="aug-item comparison-item">
+      <img src="${originalSrc}" alt="Original Image">
+      <div class="aug-label">${originalLabel}</div>
+    </div>
+    <div class="aug-item comparison-item enhanced">
+      <img src="${enhancedSrc}" alt="Real-ESRGAN Enhanced Image">
+      <div class="aug-label">${enhancedLabel}</div>
+    </div>
+  `;
+
+  ganGrid.querySelectorAll("img").forEach((img) => {
+    img.addEventListener("click", () => openZoom(img.src, img.alt));
+  });
+
+  const compareBtn = document.getElementById("open-compare-btn");
+  if (compareBtn) {
+    compareBtn.onclick = () => openCompareModal(originalSrc, enhancedSrc, {
+      originalLabel,
+      enhancedLabel,
+    });
+  }
+
+  const swapBtn = document.getElementById("swap-compare-btn");
+  if (swapBtn) {
+    swapBtn.onclick = () => {
+      toggleCompareSides();
+    };
+  }
+
+  ganCard.scrollIntoView({ behavior: "smooth", block: "start" });
+}
+
+function init() {
+  // i18n must be ready before we set up UI strings/placeholders.
+  // (async init runs in DOMContentLoaded below)
+  initTabs();
+  initImageUpload();
+  initModals();
+  initImageZoom();
+  fetchStatus();
+
+  // Toggle buttons
+  document.getElementById("ann-toggle-details").addEventListener("click", () => {
+    document.getElementById("ann-details").classList.toggle("hidden");
+  });
+  document.getElementById("cnn-toggle-details").addEventListener("click", () => {
+    document.getElementById("cnn-ranked-list").classList.toggle("hidden");
+  });
+
+  document.getElementById("tabular-form").addEventListener("submit", handleTabularSubmit);
+  // Enhance Image button handler
+  const enhanceBtn = document.getElementById('enhance-btn');
+  if (enhanceBtn) {
+    enhanceBtn.addEventListener('click', async (e) => {
+      e.preventDefault();
+      const fileInput = document.getElementById('soil-image');
+      const file = fileInput && fileInput.files[0];
+      if (!file) {
+        alert('Please select an image first.');
+        return;
+      }
+      const previewImg = document.getElementById("image-preview");
+      const previewContainer = document.getElementById("image-preview-container");
+      const originalLabel = enhanceBtn.innerHTML;
+      const originalSrc = previewImg?.src || "";
+      enhanceBtn.disabled = true;
+      enhanceBtn.textContent = "Enhancing...";
+      const reader = new FileReader();
+      reader.readAsDataURL(file);
+      reader.onload = async () => {
+        const base64 = reader.result.split(',')[1];
+        try {
+          const resp = await fetch(`${window.location.origin}/api/enhance-image`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: base64 })
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(data.error || 'Enhancement failed');
+          }
+          const enhanced = data.enhanced_image;
+          if (previewContainer) {
+            previewContainer.classList.remove("hidden");
+          }
+          const originalSize = Array.isArray(data.original_size) ? data.original_size.join("x") : "";
+          const enhancedSize = Array.isArray(data.enhanced_size) ? data.enhanced_size.join("x") : "";
+          renderEnhancementComparison(originalSrc || previewImg?.src || "", enhanced, {
+            originalLabel: originalSize ? `Original (${originalSize})` : "Original",
+            enhancedLabel: enhancedSize ? `Real-ESRGAN Enhanced (${enhancedSize}, x${data.scale || 4})` : "Real-ESRGAN Enhanced",
+          });
+        } catch (err) {
+          console.error('Enhancement error:', err);
+          alert(err.message || 'Enhancement failed');
+        } finally {
+          enhanceBtn.disabled = false;
+          enhanceBtn.innerHTML = originalLabel;
+        }
+      };
+    });
+  }
+  document.getElementById("soil-form").addEventListener("submit", handleImageSubmit);
+
+  // Chat TTS delegation
+  const history = document.getElementById("chat-history");
+  if (history) {
+    history.addEventListener("click", (e) => {
+      const btn = e.target.closest(".tts-btn");
+      if (!btn) return;
+      const bubble = btn.closest(".chat-bubble");
+      const content = bubble ? bubble.querySelector(".bubble-content") : null;
+      const text = content ? content.innerText : "";
+      speak(text);
+    });
+  }
+}
+
+async function loadImageAnalysis() {
+  const status = document.getElementById("image-analysis-status");
+  const grid = document.getElementById("image-plot-grid");
+  if (!status || !grid) return;
+
+  status.textContent = "Loading image model insights...";
+  grid.innerHTML = "";
+
+  try {
+    const response = await fetch("/api/image-metrics/list");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || "Failed to load image insights");
+
+    const plots = data.plots || [];
+    if (!plots.length) {
+      status.textContent = "No image model insights available.";
+      imageAnalysisLoaded = true;
+      return;
+    }
+
+    for (const plot of plots) {
+      const card = document.createElement("div");
+      card.className = "plot-card";
+      card.innerHTML = `
+        <h3>${plot.title}</h3>
+        <p style="font-size: 0.85rem; color: var(--text-muted); margin-bottom: 1rem;">${plot.description}</p>
+        <div class="plot-container">
+          <img src="/api/image-metrics/plot?name=${plot.name}&dpi=140" alt="${plot.title}">
+        </div>
+      `;
+      grid.appendChild(card);
+      
+      // Add zoom
+      card.querySelector('img').addEventListener('click', () => {
+        const zoomSrc = `/api/image-metrics/plot?name=${plot.name}&dpi=320`;
+        openZoom(zoomSrc, plot.title);
+      });
+    }
+
+    status.textContent = "Analysis based on source dataset and latest CNN training metrics.";
+    imageAnalysisLoaded = true;
+    loadAugmentationGallery();
+  } catch (err) {
+    status.textContent = `Error: ${err.message}`;
+    console.error(err);
+  }
+}
+
+async function loadAugmentationGallery() {
+  const grid = document.getElementById("augmentation-gallery");
+  if (!grid) return;
+
+  try {
+    const response = await fetch("/api/augmented-samples");
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error);
+
+    grid.innerHTML = data.samples.map(s => `
+      <div class="aug-item" style="border: 1px solid ${s.type.includes('Original') ? '#3b82f6' : '#10b981'};">
+        <img src="data:image/jpeg;base64,${s.data}" alt="${s.type}">
+        <div class="aug-label" style="background: ${s.type.includes('Original') ? '#3b82f6' : '#10b981'}; color: white;">
+          ${s.type}
+        </div>
+      </div>
+    `).join('');
+    
+    // Add zoom to augmentation gallery
+    grid.querySelectorAll('img').forEach(img => {
+      img.addEventListener('click', () => openZoom(img.src, img.alt));
+    });
+    
+    // Update header to show which class is being morphed
+    const header = document.querySelector("#augmentation-gallery").previousElementSibling.querySelector("h3");
+    if(header) header.textContent = `Live Data Augmentation: ${data.class.replace('_', ' ')}`;
+  } catch (err) {
+    grid.innerHTML = `<p style="color: red; padding: 1rem;">Failed to load samples: ${err.message}</p>`;
+  }
+}
+
+document.addEventListener("DOMContentLoaded", async () => {
+  await I18N.init();
+  init();
+  document.getElementById("refresh-gallery")?.addEventListener("click", loadAugmentationGallery);
+});

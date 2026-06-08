@@ -1,0 +1,31 @@
+# Dataset
+Dataset/
+solit_dataset/
+
+# Models
+# Models/ (Removed to allow pushing models via LFS)
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Virtual environment
+venv/
+.venv/
+env/
+.env
+
+Models/
+Dataset/
+
+*.pth
+*.pkl
+*.pt
+*.h5
+*.joblib
